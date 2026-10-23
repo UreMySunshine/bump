@@ -14,6 +14,7 @@ import concurrent.futures
 import json
 import os
 import queue
+from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -465,7 +466,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.theme import Theme
+from textual.theme import Theme, BUILTIN_THEMES
 from textual.widgets import Button, DataTable, Footer, Input, Label, LoadingIndicator, ProgressBar, Select, Static
 
 
@@ -503,6 +504,38 @@ PALETTES = {'dark': {'bump-bg': '#0b1220',
            'bump-overlay': '#dce4ee',
            'bump-modal': '#ffffff',
            'bump-modal-border': '#087e70'}}
+
+
+PALETTES['terminal'] = {key: 'ansi_default' for key in PALETTES['dark']}
+PALETTES['terminal'].update({
+    'bump-accent': 'ansi_cyan', 'bump-border': 'ansi_blue',
+    'bump-accent-border': 'ansi_cyan', 'bump-cursor': 'ansi_blue',
+    'bump-cursor-text': 'ansi_bright_white', 'bump-modal-border': 'ansi_cyan',
+})
+THEME_MODES = ('dark', 'light', 'terminal')
+THEME_LABELS = {'dark': '主题：深色', 'light': '主题：浅色', 'terminal': '主题：跟随终端'}
+
+
+def preferences_path():
+    root = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
+    return Path(root) / 'bump' / 'preferences.json'
+
+
+def load_theme_mode():
+    try:
+        data = json.loads(preferences_path().read_text())
+        mode = data.get('theme') if isinstance(data, dict) else None
+        return mode if mode in THEME_MODES else 'dark'
+    except (OSError, ValueError):
+        return 'dark'
+
+
+def save_theme_mode(mode):
+    path = preferences_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps({'theme': mode}) + '\n')
+    temporary.replace(path)
 
 
 class ConfirmUpdate(ModalScreen):
@@ -596,6 +629,7 @@ class BumpApp(App):
     DataTable > .datatable--odd-row { background: $bump-stripe; }
     DataTable > .datatable--even-row { background: $bump-table; }
     DataTable > .datatable--cursor { background: $bump-cursor; color: $bump-cursor-text; text-style: none; }
+    Screen.terminal-mode DataTable > .datatable--cursor { background: ansi_default; color: ansi_default; text-style: reverse; }
     #detail { height: 3; padding: 1 3 0 3; color: $bump-muted; }
     #update-progress-box { display: none; height: 3; margin: 0 3; }
     #update-progress-box.active { display: block; }
@@ -614,18 +648,19 @@ class BumpApp(App):
     '''
     BINDINGS = [Binding('slash', 'search', '搜索'), Binding('space', 'toggle', '选择'),
                 Binding('ctrl+a', 'select_visible', '选择可更新'), Binding('ctrl+n', 'clear', '清空'),
-                Binding('ctrl+t', 'theme_toggle', '深浅切换'),
+                Binding('ctrl+t', 'theme_toggle', '切换主题'),
                 Binding('ctrl+r', 'refresh', '刷新'), Binding('ctrl+q', 'quit', '退出')]
 
     def __init__(self):
         super().__init__()
         for mode, palette in PALETTES.items():
-            self.register_theme(Theme(name='bump-' + mode, dark=mode == 'dark',
+            self.register_theme(Theme(name='bump-' + mode, dark=mode != 'light', ansi=mode == 'terminal',
                                       primary=palette['bump-accent'],
                                       background=palette['bump-bg'], foreground=palette['bump-text'],
                                       surface=palette['bump-surface'], panel=palette['bump-header'],
-                                      variables=palette))
-        self.theme = 'bump-dark'
+                                      variables={**BUILTIN_THEMES['ansi-dark'].variables, **palette}))
+        self.theme_mode = load_theme_mode()
+        self.theme = 'bump-' + self.theme_mode
         self.tools = {}
         self.errors = []
         self.selected = set()
@@ -640,7 +675,7 @@ class BumpApp(App):
         with Horizontal(id='masthead'):
             yield Static('B U M P\n本机工具管理', id='brand')
             yield Static('完整清单 · 按需更新', id='subtitle')
-            yield Button('切换浅色', id='theme-toggle')
+            yield Button(THEME_LABELS[self.theme_mode], id='theme-toggle')
         with Horizontal(id='metrics'):
             yield Static('—\n已安装', id='installed', classes='metric')
             yield Static('—\n可更新', id='updates', classes='metric')
@@ -669,6 +704,7 @@ class BumpApp(App):
         yield Footer()
 
     def on_mount(self):
+        self.screen.set_class(self.theme_mode == 'terminal', 'terminal-mode')
         table = self.query_one(DataTable)
         for title, width in [('选择', 5), ('工具', 38), ('来源', 12), ('本地版本', 21), ('目标版本', 18), ('状态', 12)]:
             table.add_column(title, width=width)
@@ -744,6 +780,8 @@ class BumpApp(App):
         for tool in self.filtered_tools:
             status, color = ('未知', '#946000' if self.theme == 'bump-light' else '#e6b978') if tool.state == 'unknown' else (
                 ('已固定', '#7050a0' if self.theme == 'bump-light' else '#a8a0ce') if tool.pinned else (('可更新', '#087e70' if self.theme == 'bump-light' else '#79e1c8') if tool.outdated else ('已最新', '#53667d' if self.theme == 'bump-light' else '#91a5bf')))
+            if self.theme_mode == 'terminal':
+                color = {'未知': 'yellow', '已固定': 'magenta', '可更新': 'green', '已最新': 'default'}[status]
             table.add_row('●' if tool.key in self.selected else '○' if tool.outdated else '·', Text(tool.name),
                           {'brew': 'Homebrew', 'npm': 'npm', 'self': '独立工具'}[tool.group],
                           Text(short_version(tool.local, 21) if tool.group == "self" else tool.local or "?"),
@@ -784,8 +822,14 @@ class BumpApp(App):
             self.query_one('#detail', Static).update(Text('%s  ·  %s' % (tool.name, detail)))
 
     def action_theme_toggle(self):
-        self.theme = 'bump-light' if self.theme == 'bump-dark' else 'bump-dark'
-        self.query_one('#theme-toggle', Button).label = '切换深色' if self.theme == 'bump-light' else '切换浅色'
+        self.theme_mode = THEME_MODES[(THEME_MODES.index(self.theme_mode) + 1) % len(THEME_MODES)]
+        self.theme = 'bump-' + self.theme_mode
+        self.screen.set_class(self.theme_mode == 'terminal', 'terminal-mode')
+        self.query_one('#theme-toggle', Button).label = THEME_LABELS[self.theme_mode]
+        try:
+            save_theme_mode(self.theme_mode)
+        except OSError as exc:
+            self.notify('主题已切换，但保存失败：%s' % exc, severity='warning')
         self.render_table()
 
     def action_search(self):

@@ -109,6 +109,23 @@ class Detectors(unittest.TestCase):
 
 
 class Interface(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from tempfile import TemporaryDirectory
+        self.config = TemporaryDirectory()
+        self.addCleanup(self.config.cleanup)
+        override = patch.dict(os.environ, XDG_CONFIG_HOME=self.config.name)
+        override.start()
+        self.addCleanup(override.stop)
+
+    async def test_invalid_theme_preferences(self):
+        path = M['preferences_path']()
+        path.parent.mkdir(parents=True)
+        for contents in ['broken json', '[]', '{"theme":"unsupported"}']:
+            path.write_text(contents)
+            self.assertEqual(M['load_theme_mode'](), 'dark')
+        M['save_theme_mode']('terminal')
+        self.assertEqual(M['load_theme_mode'](), 'terminal')
+
     async def test_update_progress_success_and_failure(self):
         import threading
         gates = [threading.Event(), threading.Event()]
@@ -213,6 +230,7 @@ class Interface(unittest.IsolatedAsyncioTestCase):
                 await pilot.press('ctrl+t')
                 await pilot.pause()
                 self.assertEqual(app.theme, 'bump-light')
+                self.assertEqual(M['BumpApp']().theme, 'bump-light')
                 self.assertNotEqual(app.screen.styles.background, dark_bg)
                 self.assertEqual(len(app.selected), 1)
                 await pilot.press('enter')
@@ -222,6 +240,12 @@ class Interface(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertFalse(app.updating)
                 app.query_one('#theme-toggle').press()
+                await pilot.pause()
+                self.assertEqual(app.theme, 'bump-terminal')
+                self.assertTrue(app.native_ansi_color)
+                self.assertEqual(M['load_theme_mode'](), 'terminal')
+                self.assertEqual(M['BumpApp']().theme, 'bump-terminal')
+                app.action_theme_toggle()
                 await pilot.pause()
                 self.assertEqual(app.theme, 'bump-dark')
                 self.assertEqual(app.screen.styles.background, dark_bg)
