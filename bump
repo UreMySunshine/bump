@@ -1,0 +1,911 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["textual==8.2.8"]
+# ///
+"""bump — 检查并更新本机安装的各类工具。
+
+检测范围：Homebrew formula/cask、npm 全局包，以及自带更新命令的独立安装工具
+（bun、rustup、Rust 稳定版工具链、uv、opencode、pi、claude）。
+"""
+
+import argparse
+import concurrent.futures
+import json
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+HTTP_TIMEOUT = 20
+CHECK_TIMEOUT = 120
+UPDATE_TIMEOUT = 900
+GROUPS = ("brew", "npm", "self")
+
+
+# ── 版本解析 ──────────────────────────────────────────────────────────────
+
+def parse_version(text):
+    """把版本串解析成 (数字元组, 是否正式版)。无法解析时返回 None。
+
+    Homebrew 的部分 formula（如 ca-certificates）用日期作版本号，形如 2026-09-25，
+    按连字符分隔的多段数字处理，否则会被截成单段 2026 而无法比较。
+    """
+    if not text:
+        return None
+    date = re.match(r"^\s*v?(\d{4})-(\d{2})-(\d{2})\b", text)
+    if date:
+        return ((int(date.group(1)), int(date.group(2)), int(date.group(3))), 1)
+    m = re.search(r"(\d+(?:\.\d+)*)(?:[-+~]?([0-9A-Za-z.\-+]*))?", text.strip())
+    if not m:
+        return None
+    return (tuple(int(p) for p in m.group(1).split(".")), 0 if m.group(2) else 1)
+
+
+def is_newer(latest, local):
+    a, b = parse_version(latest), parse_version(local)
+    if a is None or b is None:
+        return False
+    width = max(len(a[0]), len(b[0]))
+    an = a[0] + (0,) * (width - len(a[0]))
+    bn = b[0] + (0,) * (width - len(b[0]))
+    if an != bn:
+        return an > bn
+    return a[1] > b[1]
+
+
+def short_version(text, limit=16):
+    """从命令输出里取出纯版本号，避免整行塞进表格。"""
+    if not text:
+        return "?"
+    for token in text.strip().split():
+        if re.match(r"^v?\d+(\.\d+)*", token):
+            return token[:limit]
+    return text.strip().split()[0][:limit]
+
+
+# ── 子进程与网络 ──────────────────────────────────────────────────────────
+
+def run(cmd, timeout=CHECK_TIMEOUT):
+    """执行命令。可执行文件不存在或执行失败时返回 None。"""
+    if not shutil.which(cmd[0]):
+        return None
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            env=dict(os.environ, HOMEBREW_NO_AUTO_UPDATE="1", NO_COLOR="1"),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+_http_cache = {}
+_http_lock = threading.Lock()
+
+
+def http_text(url):
+    with _http_lock:
+        cached = _http_cache.get(url)
+    if cached is not None:
+        return cached
+    req = urllib.request.Request(url, headers={"User-Agent": "bump/1.0"})
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        body = resp.read().decode("utf-8", "replace")
+    with _http_lock:
+        _http_cache[url] = body
+    return body
+
+
+def npm_latest(package):
+    quoted = urllib.parse.quote(package, safe="")
+    return json.loads(http_text("https://registry.npmjs.org/%s/latest" % quoted))["version"]
+
+
+def toml_version(text, section=None):
+    """读取 TOML 中某个 [section] 下（或文件顶层）的 version 字段。"""
+    body = text
+    if section:
+        start = text.find("[%s]" % section)
+        if start < 0:
+            return None
+        body = text[start:]
+        nxt = body.find("\n[", 1)
+        if nxt > 0:
+            body = body[:nxt]
+    m = re.search(r"^version\s*=\s*['\"]([^'\"]+)['\"]", body, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+# ── 数据模型 ──────────────────────────────────────────────────────────────
+
+class Tool:
+    def __init__(self, key, group, name, update_cmd=None, authoritative=False):
+        self.key = key
+        self.group = group
+        self.name = name
+        self.update_cmd = update_cmd
+        self.authoritative = authoritative   # 包管理器已直接判定为过期，无需再比版本
+        self.local = None
+        self.latest = None
+        self.state = "done"                  # done | unknown
+        self.reason = ""
+        self.pinned = False
+        self.updating = None                 # None | running | ok | failed
+        self.update_msg = ""
+
+    @property
+    def outdated(self):
+        if self.pinned or self.state != "done":
+            return False
+        if self.authoritative:
+            # 包管理器已判定过期，但它对日期型版本号（如 Homebrew 的 2026-09-25）
+            # 无法用数值比较，因此只排除两边字符串完全相同的情况
+            return self.local != self.latest
+        return self.state == "done" and is_newer(self.latest, self.local)
+
+    @property
+    def sort_key(self):
+        return (0 if self.outdated else 1, self.group, self.name.lower())
+
+
+# ── 检测器：每个函数结束时发 group_done ───────────────────────────────────
+
+def command_json(cmd, allowed=(0,)):
+    result = run(cmd)
+    if result is None:
+        raise RuntimeError('%s 无法执行或已超时' % cmd[0])
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        raise RuntimeError((result.stderr.strip() or '命令没有返回有效 JSON')[:120])
+    if isinstance(data, dict) and data.get('error'):
+        error = data['error']
+        raise RuntimeError(str(error.get('summary') or error)[:120])
+    if result.returncode not in allowed:
+        raise RuntimeError((result.stderr.strip() or '命令退出码 %s' % result.returncode)[:120])
+    return data
+
+
+def check_brew(publish):
+    inventory = command_json(['brew', 'info', '--json=v2', '--installed'])
+    problem = ''
+    try:
+        outdated = command_json(['brew', 'outdated', '--json=v2'])
+    except RuntimeError as exc:
+        outdated = {}
+        problem = str(exc)
+        publish(('error', ('brew', problem)))
+    for kind, field in [('formula', 'formulae'), ('cask', 'casks')]:
+        updates = {item['name']: item for item in outdated.get(field, [])}
+        for item in inventory.get(field, []):
+            name = item.get('name') if kind == 'formula' else item['token']
+            tool = Tool('%s:%s' % (kind, name), 'brew', name,
+                        ['brew', 'upgrade'] + (['--cask'] if kind == 'cask' else []) + [name],
+                        authoritative=True)
+            installed = item.get('installed') or []
+            if kind == 'formula':
+                versions = [entry['version'] for entry in installed]
+                tool.local = ', '.join(versions) or '?'
+                tool.description = item.get('desc') or ''
+                tool.dependency = not any(entry.get('installed_on_request') for entry in installed)
+            else:
+                tool.local = installed if isinstance(installed, str) else ', '.join(installed)
+                tool.description = item.get('desc') or ''
+            update = updates.get(name) or updates.get(item.get('full_name'))
+            tool.latest = update.get('current_version') if update else tool.local
+            tool.pinned = bool(item.get('pinned'))
+            if problem or not tool.local or tool.local == '?' or not tool.latest:
+                tool.state, tool.reason = 'unknown', problem or '版本信息不完整'
+            publish(('tool', tool))
+    publish(('group_done', 'brew'))
+
+
+def check_npm(publish):
+    inventory = command_json(['npm', 'list', '-g', '--depth=0', '--json'], allowed=(0, 1))
+    problem = ''
+    try:
+        outdated = command_json(['npm', 'outdated', '-g', '--json'], allowed=(0, 1))
+    except RuntimeError as exc:
+        outdated = {}
+        problem = str(exc)
+        publish(('error', ('npm', problem)))
+    for name, info in inventory.get('dependencies', {}).items():
+        tool = Tool('npm:%s' % name, 'npm', name,
+                    ['npm', 'install', '-g', '%s@latest' % name], authoritative=True)
+        tool.local = info.get('version') or '?'
+        tool.latest = outdated.get(name, {}).get('latest') or tool.local
+        if problem or tool.local == '?':
+            tool.state, tool.reason = 'unknown', problem or '无法读取已安装版本'
+        publish(('tool', tool))
+    publish(('group_done', 'npm'))
+
+
+def _opencode_latest():
+    # opencode 的 2.x 发布在 @opencode/cli，1.x 发布在 opencode-ai，两条线并行
+    result = run(["opencode", "--version"], timeout=60)
+    parsed = parse_version(result.stdout) if result and result.stdout.strip() else None
+    major = parsed[0][0] if parsed else 2
+    return npm_latest("@opencode/cli" if major >= 2 else "opencode-ai")
+
+
+def _cmd_version(cmd):
+    """执行 `--version` 类命令，返回标准输出。"""
+    result = run(cmd, timeout=60)
+    return result.stdout.strip() if result and result.returncode == 0 and result.stdout.strip() else None
+
+
+def _pi_local():
+    path = os.path.expanduser("~/.pi/agent/install/current-version")
+    if os.path.exists(path):
+        with open(path) as fh:
+            value = fh.read().strip()
+        if value:
+            return value
+    return _cmd_version(["pi", "--version"])
+
+
+# 仅对用户明确指定的独立安装路径使用官方安装脚本。
+UV_STANDALONE_PATH = os.environ.get("BUMP_UV_STANDALONE_PATH", "")
+
+
+def uv_update_command():
+    executable = shutil.which("uv")
+    if executable != UV_STANDALONE_PATH or os.path.islink(executable):
+        return ["uv", "self", "update"], ""
+    script = """set -eu
+installer=$(mktemp)
+trap 'rm -f "$installer"' EXIT
+curl --proto '=https' --tlsv1.2 -fLsS https://astral.sh/uv/install.sh -o "$installer"
+env UV_INSTALL_DIR="$1" UV_NO_MODIFY_PATH=1 sh "$installer"
+"""
+    return ["/bin/sh", "-c", script, "bump-uv-update", os.path.dirname(executable)], (
+        "通过 Astral 官方安装脚本更新至原目录；不修改 shell 配置")
+
+
+SELF_SPECS = [
+    ("bun", "Bun", lambda: _cmd_version(["bun", "-v"]), lambda: npm_latest("bun"),
+     ["bun", "upgrade"]),
+    ("rustup", "rustup", lambda: _cmd_version(["rustup", "--version"]),
+     lambda: toml_version(http_text("https://static.rust-lang.org/rustup/release-stable.toml")),
+     ["rustup", "self", "update"]),
+    ("rust", "Rust (stable)", lambda: _cmd_version(["rustc", "--version"]),
+     lambda: toml_version(
+         http_text("https://static.rust-lang.org/dist/channel-rust-stable.toml"), "pkg.rust"),
+     ["rustup", "update"]),
+    ("uv", "uv", lambda: _cmd_version(["uv", "--version"]),
+     lambda: json.loads(http_text("https://pypi.org/pypi/uv/json"))["info"]["version"],
+     ["uv", "self", "update"]),
+    ("opencode", "opencode", lambda: _cmd_version(["opencode", "--version"]),
+     _opencode_latest, ["opencode", "upgrade"]),
+    ("pi", "pi", _pi_local, lambda: npm_latest("@earendil-works/pi-coding-agent"),
+     ["pi", "update", "--self"]),
+    ("claude", "Claude Code", lambda: _cmd_version(["claude", "--version"]),
+     lambda: npm_latest("@anthropic-ai/claude-code"), ["claude", "update"]),
+]
+
+
+def _check_one(spec):
+    key, name, local_fn, latest_fn, update_cmd = spec
+    tool = Tool(key, "self", name, update_cmd)
+    if key == "uv":
+        tool.update_cmd, tool.description = uv_update_command()
+    try:
+        local = local_fn()
+        if not local:
+            raise RuntimeError("无法读取本地版本")
+        tool.local = local
+        tool.latest = latest_fn()
+        if not tool.latest:
+            raise RuntimeError("无法获取最新版本")
+    except Exception as exc:
+        tool.state = "unknown"
+        tool.reason = str(exc).splitlines()[0][:56] or exc.__class__.__name__
+    return tool
+
+
+def check_self(publish):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(SELF_SPECS)) as pool:
+        futures = [pool.submit(_check_one, spec) for spec in SELF_SPECS]
+        for future in concurrent.futures.as_completed(futures):
+            publish(("tool", future.result()))
+    publish(("group_done", "self"))
+
+
+def collect(publish):
+    def guarded(group, checker):
+        try:
+            checker(publish)
+        except Exception as exc:                 # 单个检测器失败不应卡住整体流程
+            publish(("error", (group, (str(exc) or type(exc).__name__).splitlines()[0][:80])))
+            publish(("group_done", group))
+
+    for group, checker in (("brew", check_brew), ("npm", check_npm), ("self", check_self)):
+        threading.Thread(target=guarded, args=(group, checker), daemon=True).start()
+
+
+def gather_blocking(on_progress=None):
+    events = queue.Queue()
+    collect(events.put)
+    tools, errors, done = [], [], set()
+    frame = 0
+    while len(done) < len(GROUPS):
+        try:
+            kind, payload = events.get(timeout=0.08)
+        except queue.Empty:
+            if on_progress:
+                on_progress(frame, len(tools))
+                frame += 1
+            continue
+        if kind == "tool":
+            tools.append(payload)
+            if on_progress:
+                on_progress(frame, len(tools))
+                frame += 1
+        elif kind == "error":
+            errors.append(payload)
+        elif kind == "group_done":
+            done.add(payload)
+    return tools, errors
+
+
+# ── 更新执行 ──────────────────────────────────────────────────────────────
+
+def run_update(tool):
+    if not tool.update_cmd:
+        return False, "没有可用的更新命令"
+    try:
+        proc = subprocess.Popen(
+            tool.update_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            output, _ = proc.communicate(timeout=UPDATE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            output, _ = proc.communicate()
+            return False, "更新超时\n" + (output or "").strip()
+        lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
+        return proc.returncode == 0, ("\n".join(lines) or "命令退出码 %s" % proc.returncode)
+    except OSError as exc:
+        return False, str(exc)
+
+
+# ── 纯文本输出 ────────────────────────────────────────────────────────────
+
+class Palette:
+    def __init__(self, enabled):
+        self.enabled = enabled
+
+    def _wrap(self, code, text):
+        return "\033[%sm%s\033[0m" % (code, text) if self.enabled else text
+
+    def dim(self, t):
+        return self._wrap("2", t)
+
+    def bold(self, t):
+        return self._wrap("1", t)
+
+    def ok(self, t):
+        return self._wrap("32", t)
+
+    def warn(self, t):
+        return self._wrap("33", t)
+
+    def err(self, t):
+        return self._wrap("31", t)
+
+    def accent(self, t):
+        return self._wrap("36", t)
+
+
+def print_plain(tools, errors, color=True):
+    pal = Palette(color and sys.stdout.isatty())
+    tools = sorted(tools, key=lambda t: t.sort_key)
+    outdated = [t for t in tools if t.outdated]
+    width = max([len(t.name) for t in tools] + [12])
+
+    print()
+    print("  " + pal.bold(pal.accent("BUMP")) + pal.dim("  ·  package update cockpit"))
+    print(pal.dim("  " + "─" * 66))
+    if not tools:
+        print(pal.dim("  没有检测到可管理的工具"))
+    for tool in tools:
+        if tool.outdated:
+            line = "  %s %-*s %s %s %s" % (
+                pal.warn("↑"), width, tool.name,
+                pal.dim(short_version(tool.local)),
+                pal.dim("→"), pal.ok(short_version(tool.latest)))
+        elif tool.state == "unknown":
+            line = "  %s %-*s %s" % (pal.err("?"), width, tool.name, pal.dim(tool.reason))
+        elif tool.pinned:
+            line = "  %s %-*s %s" % (pal.dim("·"), width, tool.name, pal.dim("已固定"))
+        else:
+            line = "  %s %-*s %s" % (pal.ok("✓"), width, tool.name,
+                                     pal.dim(short_version(tool.local)))
+        print(line)
+
+    for group, message in errors:
+        print("  %s %s: %s" % (pal.err("!"), group, message))
+
+    unknown = len([t for t in tools if t.state == "unknown"])
+    fresh = len([t for t in tools if t.state == "done" and not t.outdated and not t.pinned])
+    print(pal.dim("  " + "─" * 66))
+    print("  %s   %s   %s" % (
+        pal.warn("%d 个可更新" % len(outdated)),
+        pal.ok("%d 个已最新" % fresh),
+        pal.dim("%d 个未知" % unknown) if unknown else pal.dim(""),
+    ))
+    if outdated:
+        print(pal.dim("  使用 --json 获取机器可读结果，或在终端直接运行进入交互界面"))
+    print()
+    return len(outdated)
+
+
+def print_progress(frame, count):
+    sys.stdout.write("\r  %s  正在检测… 已发现 %d 项" % (SPINNER[frame % len(SPINNER)], count))
+    sys.stdout.flush()
+
+
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.theme import Theme
+from textual.widgets import Button, DataTable, Footer, Input, Label, LoadingIndicator, ProgressBar, Select, Static
+
+
+PALETTES = {'dark': {'bump-bg': '#0b1220',
+          'bump-text': '#d9e3f0',
+          'bump-surface': '#101b2c',
+          'bump-accent': '#79e1c8',
+          'bump-muted': '#91a5bf',
+          'bump-border': '#263750',
+          'bump-accent-border': '#367f74',
+          'bump-input': '#132035',
+          'bump-table': '#0e1828',
+          'bump-header': '#18273d',
+          'bump-stripe': '#101c2e',
+          'bump-cursor': '#244d57',
+          'bump-cursor-text': '#ecfffa',
+          'bump-button': '#1d3048',
+          'bump-overlay': '#080e19',
+          'bump-modal': '#162235',
+          'bump-modal-border': '#70ddc3'},
+ 'light': {'bump-bg': '#f2f5f9',
+           'bump-text': '#243449',
+           'bump-surface': '#ffffff',
+           'bump-accent': '#087e70',
+           'bump-muted': '#53667d',
+           'bump-border': '#cbd5e1',
+           'bump-accent-border': '#72b6aa',
+           'bump-input': '#ffffff',
+           'bump-table': '#ffffff',
+           'bump-header': '#e5ecf4',
+           'bump-stripe': '#f3f6fa',
+           'bump-cursor': '#ccece5',
+           'bump-cursor-text': '#123d36',
+           'bump-button': '#dfe7f0',
+           'bump-overlay': '#dce4ee',
+           'bump-modal': '#ffffff',
+           'bump-modal-border': '#087e70'}}
+
+
+class ConfirmUpdate(ModalScreen):
+    CSS = '''
+    ConfirmUpdate { align: center middle; background: $bump-overlay 80%; }
+    #confirm { width: 64; height: auto; padding: 2 3; background: $bump-modal; border: round $bump-modal-border; }
+    #confirm Label { margin-bottom: 1; }
+    #confirm Horizontal { height: 3; align-horizontal: right; }
+    #confirm Button { margin-left: 1; }
+    '''
+    BINDINGS = [('escape', 'cancel', '取消')]
+
+    def __init__(self, names):
+        super().__init__()
+        self.names = names
+
+    def compose(self):
+        with Vertical(id='confirm'):
+            yield Label('执行更新', classes='title')
+            yield Label(Text('将运行以下 %d 项的更新命令：\n\n%s' %
+                             (len(self.names), '\n'.join(self.names))))
+            with Horizontal():
+                yield Button('取消', id='cancel')
+                yield Button('确认更新', id='confirm-update', variant='primary')
+
+    def on_button_pressed(self, event):
+        self.dismiss(event.button.id == 'confirm-update')
+
+    def action_cancel(self):
+        self.dismiss(False)
+
+
+class PackageTable(DataTable):
+    BINDINGS = [
+        Binding('h', 'cursor_left', '左移', show=False),
+        Binding('j', 'cursor_down', '下移', show=False),
+        Binding('k', 'cursor_up', '上移', show=False),
+        Binding('l', 'cursor_right', '右移', show=False),
+        Binding('enter', 'app.request_update', '更新所选'),
+    ]
+
+
+class UpdateResult(ModalScreen):
+    CSS = """
+    UpdateResult { align: center middle; background: $bump-overlay 80%; }
+    #result { width: 80%; height: 75%; padding: 1 2; border: round $bump-modal-border; background: $bump-modal; }
+    #result-scroll { height: 1fr; margin: 1 0; }
+    #result Button { align-horizontal: right; }
+    """
+    BINDINGS = [('escape', 'close', '关闭')]
+
+    def __init__(self, message):
+        super().__init__()
+        self.message = message
+
+    def compose(self):
+        with Vertical(id='result'):
+            yield Label('更新结果')
+            with VerticalScroll(id='result-scroll'):
+                yield Static(Text(self.message))
+            yield Button('关闭', id='close-result')
+
+    def on_button_pressed(self, event):
+        self.dismiss()
+
+    def action_close(self):
+        self.dismiss()
+
+
+class BumpApp(App):
+    TITLE = 'Bump'
+    ENABLE_COMMAND_PALETTE = False
+    CSS = '''
+    Screen { background: $bump-bg; color: $bump-text; }
+    #masthead { height: 5; padding: 1 3; background: $bump-surface; }
+    #brand { width: 1fr; color: $bump-accent; text-style: bold; }
+    #theme-toggle { width: 16; margin-left: 2; }
+    #subtitle { width: 36; color: $bump-muted; content-align: right middle; }
+    #metrics { height: 5; margin: 1 3; }
+    .metric { width: 1fr; height: 5; padding: 0 2; margin-right: 1; border: round $bump-border; background: $bump-surface; }
+    #updates { border: round $bump-accent-border; color: $bump-accent; }
+    #filters { height: 3; margin: 0 3 1 3; }
+    #search { width: 1fr; margin-right: 1; }
+    Select { width: 22; margin-left: 1; }
+    Input, SelectCurrent { background: $bump-input; border: tall $bump-border; }
+    Input:focus, Select:focus SelectCurrent { border: tall $bump-accent; }
+    #table-box { height: 1fr; margin: 0 3; border: round $bump-border; background: $bump-table; }
+    #table-heading { height: 2; padding: 0 2; color: $bump-muted; }
+    DataTable { height: 1fr; background: $bump-table; padding: 0 1; }
+    DataTable > .datatable--header { background: $bump-header; color: $bump-muted; text-style: bold; }
+    DataTable > .datatable--odd-row { background: $bump-stripe; }
+    DataTable > .datatable--even-row { background: $bump-table; }
+    DataTable > .datatable--cursor { background: $bump-cursor; color: $bump-cursor-text; text-style: none; }
+    #detail { height: 3; padding: 1 3 0 3; color: $bump-muted; }
+    #update-progress-box { display: none; height: 3; margin: 0 3; }
+    #update-progress-box.active { display: block; }
+    #update-spinner { width: 5; height: 1; color: $bump-accent; }
+    #update-progress { width: 1fr; height: 1; }
+    #update-progress Bar { width: 1fr; }
+    #update-progress .bar--bar { color: $bump-accent; }
+    #update-progress .bar--complete, #update-progress .bar--indeterminate { color: $bump-accent; }
+    #update-progress PercentageStatus { color: $bump-accent; }
+    #update-summary { width: 36; height: 1; content-align: right middle; color: $bump-muted; }
+    #actions { height: 3; margin: 0 3 1 3; }
+    #status { width: 1fr; content-align: left middle; color: $bump-muted; }
+    Button { min-width: 14; margin-left: 1; border: none; background: $bump-button; }
+    Button.-primary { background: $bump-accent; color: $bump-bg; text-style: bold; }
+    Footer { background: $bump-surface; color: $bump-muted; }
+    '''
+    BINDINGS = [Binding('slash', 'search', '搜索'), Binding('space', 'toggle', '选择'),
+                Binding('ctrl+a', 'select_visible', '选择可更新'), Binding('ctrl+n', 'clear', '清空'),
+                Binding('ctrl+t', 'theme_toggle', '深浅切换'),
+                Binding('ctrl+r', 'refresh', '刷新'), Binding('ctrl+q', 'quit', '退出')]
+
+    def __init__(self):
+        super().__init__()
+        for mode, palette in PALETTES.items():
+            self.register_theme(Theme(name='bump-' + mode, dark=mode == 'dark',
+                                      primary=palette['bump-accent'],
+                                      background=palette['bump-bg'], foreground=palette['bump-text'],
+                                      surface=palette['bump-surface'], panel=palette['bump-header'],
+                                      variables=palette))
+        self.theme = 'bump-dark'
+        self.tools = {}
+        self.errors = []
+        self.selected = set()
+        self.events = queue.Queue()
+        self.done = set()
+        self.checking = False
+        self.updating = False
+        self.filtered_tools = []
+        self.last_update_result = ''
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id='masthead'):
+            yield Static('B U M P\n本机工具管理', id='brand')
+            yield Static('完整清单 · 按需更新', id='subtitle')
+            yield Button('切换浅色', id='theme-toggle')
+        with Horizontal(id='metrics'):
+            yield Static('—\n已安装', id='installed', classes='metric')
+            yield Static('—\n可更新', id='updates', classes='metric')
+            yield Static('—\n已最新', id='fresh', classes='metric')
+            yield Static('—\n未知 / 固定', id='unknown', classes='metric')
+        with Horizontal(id='filters'):
+            yield Input(placeholder='搜索工具名称…', id='search')
+            yield Select([('全部来源', 'all'), ('Homebrew', 'brew'), ('npm 全局', 'npm'),
+                          ('独立工具', 'self')], value='all', allow_blank=False, id='source')
+            yield Select([('全部状态', 'all'), ('可更新', 'updates'), ('已最新', 'fresh'),
+                          ('未知', 'unknown'), ('已固定', 'pinned')], value='all',
+                         allow_blank=False, id='state')
+        with Vertical(id='table-box'):
+            yield Static('正在读取安装清单', id='table-heading')
+            yield PackageTable(id='packages', cursor_type='row', zebra_stripes=True)
+        yield Static('选择一项查看详情', id='detail')
+        with Horizontal(id='update-progress-box'):
+            yield LoadingIndicator(id='update-spinner')
+            yield ProgressBar(total=1, show_eta=False, id='update-progress')
+            yield Static('', id='update-summary')
+        with Horizontal(id='actions'):
+            yield Static('准备检查', id='status')
+            yield Button('更新结果', id='result-button', disabled=True)
+            yield Button('重新检查', id='refresh')
+            yield Button('更新所选 (0)', id='update', variant='primary', disabled=True)
+        yield Footer()
+
+    def on_mount(self):
+        table = self.query_one(DataTable)
+        for title, width in [('选择', 5), ('工具', 38), ('来源', 12), ('本地版本', 21), ('目标版本', 18), ('状态', 12)]:
+            table.add_column(title, width=width)
+        table.focus()
+        self.set_interval(0.1, self.drain)
+        self.action_refresh()
+
+    def action_refresh(self):
+        if self.checking or self.updating:
+            return
+        self.tools.clear()
+        self.errors.clear()
+        self.selected.clear()
+        self.done.clear()
+        with _http_lock:
+            _http_cache.clear()
+        self.checking = True
+        self.query_one('#status', Static).update('正在检查  ·  0 / 3 来源')
+        self.render_table()
+        collect(self.events.put)
+
+    def drain(self):
+        changed = False
+        completed_check = False
+        while not self.events.empty():
+            kind, payload = self.events.get_nowait()
+            if kind == 'tool':
+                self.tools[payload.key] = payload
+                changed = True
+            elif kind == 'error':
+                self.errors.append(payload)
+            elif kind == 'group_done':
+                self.done.add(payload)
+                self.checking = len(self.done) < len(GROUPS)
+                completed_check = not self.checking
+                message = '正在检查  ·  %d / 3 来源' % len(self.done) if self.checking else '检查完成'
+                if self.errors:
+                    message += '  ·  ' + '; '.join('%s: %s' % e for e in self.errors)
+                self.query_one('#status', Static).update(Text(message))
+                changed = True
+            elif kind == 'update_progress':
+                completed, total, current, failed = payload
+                self.query_one('#update-progress', ProgressBar).update(total=total, progress=completed)
+                self.query_one('#update-summary', Static).update(
+                    '已处理 %d / %d · 成功 %d · 失败 %d' % (completed, total, completed - failed, failed))
+                self.query_one('#status', Static).update(Text('正在更新 %s' % current if current else '更新任务已结束'))
+            elif kind == 'update_done':
+                self.updating = False
+                self.query_one('#update-spinner').display = False
+                self.last_update_result = payload
+                self.query_one('#result-button', Button).disabled = False
+                self.action_refresh()
+                self.push_screen(UpdateResult(payload))
+        if changed:
+            self.render_table()
+        if completed_check:
+            self.query_one(DataTable).move_cursor(row=0)
+
+    def matches(self, tool):
+        source = self.query_one('#source', Select).value
+        state = self.query_one('#state', Select).value
+        query = self.query_one(Input).value.casefold().strip()
+        return (source == 'all' or tool.group == source) and query in tool.name.casefold() and (
+            state == 'all' or state == 'updates' and tool.outdated or
+            state == 'fresh' and tool.state == 'done' and not tool.outdated and not tool.pinned or
+            state == 'unknown' and tool.state == 'unknown' or state == 'pinned' and tool.pinned)
+
+    def render_table(self):
+        table = self.query_one(DataTable)
+        old_key = self.filtered_tools[table.cursor_row].key if self.filtered_tools and table.cursor_row < len(self.filtered_tools) else None
+        self.filtered_tools = [t for t in sorted(self.tools.values(), key=lambda t: t.sort_key) if self.matches(t)]
+        table.clear()
+        for tool in self.filtered_tools:
+            status, color = ('未知', '#946000' if self.theme == 'bump-light' else '#e6b978') if tool.state == 'unknown' else (
+                ('已固定', '#7050a0' if self.theme == 'bump-light' else '#a8a0ce') if tool.pinned else (('可更新', '#087e70' if self.theme == 'bump-light' else '#79e1c8') if tool.outdated else ('已最新', '#53667d' if self.theme == 'bump-light' else '#91a5bf')))
+            table.add_row('●' if tool.key in self.selected else '○' if tool.outdated else '·', Text(tool.name),
+                          {'brew': 'Homebrew', 'npm': 'npm', 'self': '独立工具'}[tool.group],
+                          Text(short_version(tool.local, 21) if tool.group == "self" else tool.local or "?"),
+                          Text(short_version(tool.latest, 18) if tool.outdated else '—'), Text(status, style=color), key=tool.key)
+        if old_key:
+            row = next((i for i, t in enumerate(self.filtered_tools) if t.key == old_key), 0)
+            table.move_cursor(row=row)
+        values = list(self.tools.values())
+        updates = sum(t.outdated for t in values)
+        unknown = sum(t.state == 'unknown' for t in values)
+        pinned = sum(t.pinned for t in values)
+        fresh = sum(t.state == 'done' and not t.outdated and not t.pinned for t in values)
+        for id_, text in [('installed', '%d\n已安装' % len(values)), ('updates', '%d\n可更新' % updates),
+                          ('fresh', '%d\n已最新' % fresh), ('unknown', '%d / %d\n未知 / 固定' % (unknown, pinned))]:
+            self.query_one('#' + id_, Static).update(text)
+        counts = {g: sum(t.group == g for t in values) for g in GROUPS}
+        self.query_one('#table-heading', Static).update('显示 %d / %d 项    ·    Homebrew %d    npm %d    独立工具 %d' %
+            (len(self.filtered_tools), len(values), counts['brew'], counts['npm'], counts['self']))
+        button = self.query_one('#update', Button)
+        button.label = '更新所选 (%d)' % len(self.selected)
+        button.disabled = not self.selected or self.checking or self.updating
+        self.query_one('#refresh', Button).disabled = self.checking or self.updating
+        if not self.filtered_tools:
+            self.query_one('#detail', Static).update('没有匹配项' if not self.checking else '正在读取安装清单…')
+
+    def on_input_changed(self, event):
+        self.render_table()
+
+    def on_select_changed(self, event):
+        self.render_table()
+
+    def on_data_table_row_highlighted(self, event):
+        tool = self.tools.get(event.row_key.value)
+        if tool:
+            detail = tool.reason or '本地版本：%s  %s' % (tool.local, getattr(tool, 'description', ''))
+            if getattr(tool, 'dependency', False):
+                detail = '依赖包 · ' + detail
+            self.query_one('#detail', Static).update(Text('%s  ·  %s' % (tool.name, detail)))
+
+    def action_theme_toggle(self):
+        self.theme = 'bump-light' if self.theme == 'bump-dark' else 'bump-dark'
+        self.query_one('#theme-toggle', Button).label = '切换深色' if self.theme == 'bump-light' else '切换浅色'
+        self.render_table()
+
+    def action_search(self):
+        self.query_one(Input).focus()
+
+    def action_toggle(self):
+        if not self.query_one(DataTable).has_focus or self.updating:
+            return
+        row = self.query_one(DataTable).cursor_row
+        if row < len(self.filtered_tools) and self.filtered_tools[row].outdated:
+            self.selected.symmetric_difference_update({self.filtered_tools[row].key})
+            self.render_table()
+
+    def action_select_visible(self):
+        if self.query_one(DataTable).has_focus and not self.updating:
+            self.selected.update(t.key for t in self.filtered_tools if t.outdated)
+            self.render_table()
+
+    def action_clear(self):
+        if not self.updating:
+            self.selected.clear()
+            self.render_table()
+
+    def on_button_pressed(self, event):
+        if event.button.id == 'theme-toggle':
+            self.action_theme_toggle()
+        elif event.button.id == 'result-button' and self.last_update_result:
+            self.push_screen(UpdateResult(self.last_update_result))
+        elif event.button.id == 'refresh':
+            self.action_refresh()
+        elif event.button.id == 'update':
+            self.action_request_update()
+
+    def action_request_update(self):
+        if self.selected and not self.checking and not self.updating:
+            targets = [t for t in self.tools.values() if t.key in self.selected and t.outdated]
+            self.push_screen(ConfirmUpdate([t.name + (' · ' + t.description if t.key == 'uv' and getattr(t, 'description', '') else '') for t in targets]), lambda confirmed: self.begin_update(targets) if confirmed else None)
+
+    def begin_update(self, targets):
+        if not targets or self.updating:
+            return
+        self.query_one('#update-progress-box').add_class('active')
+        self.query_one('#update-spinner').display = True
+        self.query_one('#update-progress', ProgressBar).update(total=len(targets), progress=0)
+        self.query_one('#update-summary', Static).update('已处理 0 / %d · 成功 0 · 失败 0' % len(targets))
+        self.updating = True
+        self.render_table()
+        self.run_worker(lambda: self.update_worker(targets), thread=True)
+
+    def update_worker(self, targets):
+        failures = []
+        for index, tool in enumerate(targets, 1):
+            self.events.put(('update_progress', (index - 1, len(targets), tool.name, len(failures))))
+            try:
+                ok, message = run_update(tool)
+            except Exception as exc:
+                ok, message = False, str(exc)
+            if not ok:
+                failures.append('%s\n命令：%s\n%s' % (tool.name, ' '.join(tool.update_cmd or []), message))
+            self.events.put(('update_progress', (index, len(targets), None, len(failures))))
+        message = '更新完成：%d 成功，%d 失败' % (len(targets) - len(failures), len(failures))
+        if failures:
+            message += '\n' + '\n'.join(failures)
+        self.events.put(('update_done', message))
+
+    def action_quit(self):
+        if self.updating:
+            self.notify('更新进行中，请等待完成', severity='warning')
+        else:
+            self.exit()
+
+
+def run_tui():
+    BumpApp().run()
+
+
+# ── 入口 ──────────────────────────────────────────────────────────────────
+
+def main(argv):
+    parser = argparse.ArgumentParser(
+        prog="bump",
+        description="检查并更新本机安装的工具：Homebrew、npm 全局包、"
+                    "以及自带更新命令的独立工具（bun、rustup、Rust、uv、opencode、pi、claude）",
+    )
+    parser.add_argument("-c", "--check", action="store_true",
+                        help="只打印检查结果，不进入交互界面")
+    parser.add_argument("--json", action="store_true", help="以 JSON 输出检查结果")
+    parser.add_argument("--no-color", action="store_true", help="关闭彩色输出")
+    args = parser.parse_args(argv)
+
+    interactive = not (args.check or args.json) and sys.stdout.isatty() and sys.stdin.isatty()
+
+    if interactive:
+        return run_tui() or 0
+
+    tools, errors = gather_blocking(None if args.json else print_progress)
+    if not args.json:
+        sys.stdout.write("\r" + " " * 60 + "\r")
+
+    if args.json:
+        payload = [
+            {
+                "name": t.name,
+                "group": t.group,
+                "local": t.local,
+                "latest": t.latest,
+                "outdated": t.outdated,
+                "state": t.state,
+                "reason": t.reason,
+            }
+            for t in sorted(tools, key=lambda t: t.sort_key)
+        ]
+        print(json.dumps({"tools": payload, "errors": errors}, indent=2, ensure_ascii=False))
+        return 0
+
+    return 1 if print_plain(tools, errors, color=not args.no_color) else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
