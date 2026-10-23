@@ -14,7 +14,17 @@
 
 ## 安装与运行
 
-需要 [uv](https://docs.astral.sh/uv/getting-started/installation/)：
+推荐使用 Homebrew：
+
+```sh
+brew install uremysunshine/tap/bump
+bump
+```
+
+Homebrew 使用独立的 Python 环境及固定版本依赖，首次运行无需下载 Textual。
+升级使用 `brew update && brew upgrade uremysunshine/tap/bump`。
+
+从源码运行需要 [uv](https://docs.astral.sh/uv/getting-started/installation/)：
 
 ```sh
 git clone https://github.com/UreMySunshine/bump.git
@@ -85,6 +95,18 @@ uv run --with textual==8.2.8 --python 3.14 python test_bump.py
 
 测试模拟包清单和更新程序，不实际升级工具。
 
-## Homebrew
+## 发布
 
-目前尚未发布 Homebrew formula。可通过个人 tap 提供安装，后续需准备固定版本源码、依赖资源、校验值和安装测试。
+修改 `bump` 中的 VERSION 并提交后，推送对应的 `vMAJOR.MINOR.PATCH` 标签。
+Release 工作流运行测试，发布源码压缩包、依赖清单和 SHA256 校验文件。
+
+[个人 tap](https://github.com/UreMySunshine/homebrew-tap) 每小时检查最新稳定版本，
+通过 macOS 安装与运行测试后自动更新 formula；也可以手动触发 Publish formula。
+GitHub 定时任务可能延迟，公开仓库长期无活动时会暂停定时运行。
+
+更改依赖时，应同步更新 requirements.lock 和 homebrew-resources.json；
+后者记录各固定版本纯 Python wheel 的 PyPI 下载地址和 SHA256。
+
+## 许可证
+
+[MIT](LICENSE)

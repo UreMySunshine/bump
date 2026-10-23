@@ -24,6 +24,8 @@ import time
 import urllib.parse
 import urllib.request
 
+VERSION = "0.1.0"
+
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 HTTP_TIMEOUT = 20
 CHECK_TIMEOUT = 120
@@ -914,6 +916,7 @@ def main(argv):
         description="检查并更新本机安装的工具：Homebrew、npm 全局包、"
                     "以及自带更新命令的独立工具（bun、rustup、Rust、uv、opencode、pi、claude）",
     )
+    parser.add_argument("--version", action="version", version="bump " + VERSION)
     parser.add_argument("-c", "--check", action="store_true",
                         help="只打印检查结果，不进入交互界面")
     parser.add_argument("--json", action="store_true", help="以 JSON 输出检查结果")
