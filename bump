@@ -24,7 +24,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 HTTP_TIMEOUT = 20
@@ -364,7 +364,15 @@ def gather_blocking(on_progress=None):
 
 # ── 更新执行 ──────────────────────────────────────────────────────────────
 
-def run_update(tool):
+def update_stage(line):
+    if re.search(r'\b(unpack\w*|extract\w*|pouring|install\w*|building|linking)\b|安装|解压|构建', line, re.I):
+        return '正在安装'
+    if re.search(r'\b(download\w*|fetch\w*|receiv\w*|retriev\w*)\b|下载', line, re.I):
+        return '正在下载'
+    return None
+
+
+def run_update(tool, on_output=None):
     if not tool.update_cmd:
         return False, "没有可用的更新命令"
     try:
@@ -374,14 +382,33 @@ def run_update(tool):
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             text=True,
+            errors='replace',
         )
+        lines = []
+        finished = threading.Event()
+        def read_output():
+            with proc.stdout:
+                for raw in proc.stdout:
+                    if finished.is_set():
+                        break
+                    line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', raw).strip()
+                    if line:
+                        lines.append(line)
+                        if on_output:
+                            on_output(line)
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        timed_out = False
         try:
-            output, _ = proc.communicate(timeout=UPDATE_TIMEOUT)
+            proc.wait(timeout=UPDATE_TIMEOUT)
         except subprocess.TimeoutExpired:
+            timed_out = True
             proc.kill()
-            output, _ = proc.communicate()
-            return False, "更新超时\n" + (output or "").strip()
-        lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
+            proc.wait()
+        reader.join(timeout=2)
+        finished.set()
+        if timed_out:
+            return False, '更新超时\n' + '\n'.join(lines)
         return proc.returncode == 0, ("\n".join(lines) or "命令退出码 %s" % proc.returncode)
     except OSError as exc:
         return False, str(exc)
@@ -469,7 +496,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.theme import Theme, BUILTIN_THEMES
-from textual.widgets import Button, DataTable, Footer, Input, Label, LoadingIndicator, ProgressBar, Select, Static
+from textual.widgets import Button, DataTable, Footer, Input, Label, Select, Static
 
 
 PALETTES = {'dark': {'bump-bg': '#0b1220',
@@ -541,6 +568,7 @@ def save_theme_mode(mode):
 
 
 class ConfirmUpdate(ModalScreen):
+    AUTO_FOCUS = '#confirm-update'
     CSS = '''
     ConfirmUpdate { align: center middle; background: $bump-overlay 80%; }
     #confirm { width: 64; height: auto; padding: 2 3; background: $bump-modal; border: round $bump-modal-border; }
@@ -633,15 +661,10 @@ class BumpApp(App):
     DataTable > .datatable--cursor { background: $bump-cursor; color: $bump-cursor-text; text-style: none; }
     Screen.terminal-mode DataTable > .datatable--cursor { background: ansi_default; color: ansi_default; text-style: reverse; }
     #detail { height: 3; padding: 1 3 0 3; color: $bump-muted; }
-    #update-progress-box { display: none; height: 3; margin: 0 3; }
+    #update-progress-box { display: none; height: 10; max-height: 45%; margin: 0 3; border: round $bump-accent-border; background: $bump-table; }
     #update-progress-box.active { display: block; }
-    #update-spinner { width: 5; height: 1; color: $bump-accent; }
-    #update-progress { width: 1fr; height: 1; }
-    #update-progress Bar { width: 1fr; }
-    #update-progress .bar--bar { color: $bump-accent; }
-    #update-progress .bar--complete, #update-progress .bar--indeterminate { color: $bump-accent; }
-    #update-progress PercentageStatus { color: $bump-accent; }
-    #update-summary { width: 36; height: 1; content-align: right middle; color: $bump-muted; }
+    #update-progress-box.running { height: 1fr; max-height: 100%; }
+    #update-summary { height: 2; padding: 0 1; color: $bump-accent; }
     #actions { height: 3; margin: 0 3 1 3; }
     #status { width: 1fr; content-align: left middle; color: $bump-muted; }
     Button { min-width: 14; margin-left: 1; border: none; background: $bump-button; }
@@ -694,10 +717,9 @@ class BumpApp(App):
             yield Static('正在读取安装清单', id='table-heading')
             yield PackageTable(id='packages', cursor_type='row', zebra_stripes=True)
         yield Static('选择一项查看详情', id='detail')
-        with Horizontal(id='update-progress-box'):
-            yield LoadingIndicator(id='update-spinner')
-            yield ProgressBar(total=1, show_eta=False, id='update-progress')
+        with Vertical(id='update-progress-box'):
             yield Static('', id='update-summary')
+            yield DataTable(id='update-items', cursor_type='none', zebra_stripes=True)
         with Horizontal(id='actions'):
             yield Static('准备检查', id='status')
             yield Button('更新结果', id='result-button', disabled=True)
@@ -710,6 +732,9 @@ class BumpApp(App):
         table = self.query_one(DataTable)
         for title, width in [('选择', 5), ('工具', 38), ('来源', 12), ('本地版本', 21), ('目标版本', 18), ('状态', 12)]:
             table.add_column(title, width=width)
+        progress = self.query_one('#update-items', DataTable)
+        for title, key, width in [('更新项目', 'name', 30), ('当前状态', 'stage', 14), ('最近输出', 'detail', 66)]:
+            progress.add_column(title, key=key, width=width)
         table.focus()
         self.set_interval(0.1, self.drain)
         self.action_refresh()
@@ -749,13 +774,19 @@ class BumpApp(App):
                 changed = True
             elif kind == 'update_progress':
                 completed, total, current, failed = payload
-                self.query_one('#update-progress', ProgressBar).update(total=total, progress=completed)
                 self.query_one('#update-summary', Static).update(
                     '已处理 %d / %d · 成功 %d · 失败 %d' % (completed, total, completed - failed, failed))
                 self.query_one('#status', Static).update(Text('正在更新 %s' % current if current else '更新任务已结束'))
+            elif kind == 'update_item':
+                key, stage, detail = payload
+                progress = self.query_one('#update-items', DataTable)
+                progress.update_cell(key, 'stage', Text(stage))
+                progress.update_cell(key, 'detail', Text(detail[-1000:]))
             elif kind == 'update_done':
                 self.updating = False
-                self.query_one('#update-spinner').display = False
+                self.query_one('#update-progress-box').remove_class('running')
+                self.query_one('#table-box').display = True
+                self.query_one('#detail').display = True
                 self.last_update_result = payload
                 self.query_one('#result-button', Button).disabled = False
                 self.action_refresh()
@@ -873,9 +904,13 @@ class BumpApp(App):
     def begin_update(self, targets):
         if not targets or self.updating:
             return
-        self.query_one('#update-progress-box').add_class('active')
-        self.query_one('#update-spinner').display = True
-        self.query_one('#update-progress', ProgressBar).update(total=len(targets), progress=0)
+        self.query_one('#update-progress-box').add_class('active', 'running')
+        self.query_one('#table-box').display = False
+        self.query_one('#detail').display = False
+        progress = self.query_one('#update-items', DataTable)
+        progress.clear()
+        for tool in targets:
+            progress.add_row(Text(tool.name), '等待更新', '—', key=tool.key)
         self.query_one('#update-summary', Static).update('已处理 0 / %d · 成功 0 · 失败 0' % len(targets))
         self.updating = True
         self.render_table()
@@ -885,12 +920,18 @@ class BumpApp(App):
         failures = []
         for index, tool in enumerate(targets, 1):
             self.events.put(('update_progress', (index - 1, len(targets), tool.name, len(failures))))
+            self.events.put(('update_item', (tool.key, '正在执行', '等待更新命令输出…')))
+            def on_output(line, key=tool.key, state=['正在执行']):
+                state[0] = update_stage(line) or state[0]
+                self.events.put(('update_item', (key, state[0], line)))
             try:
-                ok, message = run_update(tool)
+                ok, message = run_update(tool, on_output)
             except Exception as exc:
                 ok, message = False, str(exc)
             if not ok:
                 failures.append('%s\n命令：%s\n%s' % (tool.name, ' '.join(tool.update_cmd or []), message))
+            self.events.put(('update_item', (tool.key, '更新成功' if ok else '更新失败',
+                                             message.splitlines()[-1] if message else '命令执行完成')))
             self.events.put(('update_progress', (index, len(targets), None, len(failures))))
         message = '更新完成：%d 成功，%d 失败' % (len(targets) - len(failures), len(failures))
         if failures:

@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import runpy
+import sys
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -107,6 +109,46 @@ class Detectors(unittest.TestCase):
         self.assertFalse(M['is_newer']('1.0', '1.0.0'))
         self.assertTrue(M['is_newer']('2026-10-20', '2026-09-25'))
 
+    def test_update_output_streams_before_exit_and_preserves_failure(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            gate = Path(directory) / 'continue'
+            tool = M['Tool']('demo', 'npm', 'demo')
+            tool.update_cmd = [sys.executable, '-u', '-c',
+                'import pathlib,sys,time; print("Downloading demo\\r", flush=True); '
+                'gate=pathlib.Path(sys.argv[1]); '
+                '\nwhile not gate.exists(): time.sleep(0.01)\n'
+                'print("Installing demo", flush=True); print("permission denied", flush=True); sys.exit(1)', str(gate)]
+            downloading = threading.Event()
+            lines, result = [], []
+            def output(line):
+                lines.append(line)
+                downloading.set()
+            worker = threading.Thread(target=lambda: result.append(M['run_update'](tool, output)))
+            worker.start()
+            try:
+                self.assertTrue(downloading.wait(5))
+                self.assertTrue(worker.is_alive())
+                self.assertEqual(M['update_stage'](lines[0]), '正在下载')
+            finally:
+                gate.touch()
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(M['update_stage'](lines[1]), '正在安装')
+            self.assertIsNone(M['update_stage']('checking version'))
+            self.assertFalse(result[0][0])
+            self.assertIn('permission denied', result[0][1])
+
+    def test_update_timeout_keeps_output(self):
+        tool = M['Tool']('demo', 'npm', 'demo')
+        tool.update_cmd = [sys.executable, '-u', '-c',
+                           'import time; print("Downloading demo", flush=True); time.sleep(5)']
+        with patch.dict(G, UPDATE_TIMEOUT=0.3):
+            ok, message = M['run_update'](tool)
+        self.assertFalse(ok)
+        self.assertIn('更新超时', message)
+        self.assertIn('Downloading demo', message)
+
 
 class Interface(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -126,10 +168,35 @@ class Interface(unittest.IsolatedAsyncioTestCase):
         M['save_theme_mode']('terminal')
         self.assertEqual(M['load_theme_mode'](), 'terminal')
 
+    async def test_enter_opens_then_confirms_update(self):
+        tool = M['Tool']('demo', 'npm', 'demo')
+        tool.local, tool.latest = '1', '2'
+        def collect(publish):
+            publish(('tool', tool))
+            for group in M['GROUPS']:
+                publish(('group_done', group))
+        with patch.dict(G, collect=collect):
+            app = M['BumpApp']()
+            with patch.object(app, 'begin_update') as update:
+                async with app.run_test(size=(140, 40)) as pilot:
+                    await pilot.pause()
+                    await pilot.press('space', 'enter')
+                    self.assertIsInstance(app.screen, M['ConfirmUpdate'])
+                    update.assert_not_called()
+                    await pilot.press('enter')
+                    await pilot.pause()
+                    update.assert_called_once_with([tool])
+                    app.action_request_update()
+                    await pilot.pause()
+                    await pilot.press('escape')
+                    self.assertEqual(update.call_count, 1)
+
     async def test_update_progress_success_and_failure(self):
         import threading
         gates = [threading.Event(), threading.Event()]
         started = [threading.Event(), threading.Event()]
+        installing = threading.Event()
+        finish_install = threading.Event()
         targets = []
         for i in range(2):
             tool = M['Tool'](str(i), 'npm', 'demo-' + str(i))
@@ -140,10 +207,15 @@ class Interface(unittest.IsolatedAsyncioTestCase):
                 publish(('tool', tool))
             for group in M['GROUPS']:
                 publish(('group_done', group))
-        def update(tool):
+        def update(tool, on_output):
             i = targets.index(tool)
+            on_output("Downloading demo-" + str(i))
             started[i].set()
             gates[i].wait(5)
+            if not i:
+                on_output('Installing demo-0')
+                installing.set()
+                finish_install.wait(5)
             if i:
                 raise RuntimeError('模拟失败')
             return True, ''
@@ -154,19 +226,31 @@ class Interface(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
                     app.begin_update(targets)
                     await pilot.pause()
-                    bar = app.query_one('#update-progress')
+                    progress = app.query_one('#update-items')
                     self.assertTrue(started[0].is_set())
-                    self.assertEqual(bar.progress, 0)
+                    self.assertEqual(str(progress.get_cell('0', 'stage')), '正在下载')
+                    self.assertEqual(str(progress.get_cell('1', 'stage')), '等待更新')
                     self.assertTrue(app.query_one('#update-progress-box').display)
                     gates[0].set()
                     for _ in range(30):
                         await pilot.pause(0.05)
-                        if started[1].is_set() and bar.progress == 1:
+                        if installing.is_set() and str(progress.get_cell('0', 'stage')) == '正在安装':
                             break
-                    self.assertEqual(bar.progress, 1)
-                    self.assertEqual(bar.percentage, 0.5)
+                    self.assertEqual(str(progress.get_cell('0', 'stage')), '正在安装')
+                    self.assertEqual(str(progress.get_cell('1', 'stage')), '等待更新')
+                    await pilot.resize_terminal(90, 28)
+                    await pilot.pause()
+                    self.assertGreater(progress.size.height, 2)
+                    self.assertLessEqual(progress.region.bottom, 28)
+                    finish_install.set()
+                    for _ in range(30):
+                        await pilot.pause(0.05)
+                        if started[1].is_set() and str(progress.get_cell('0', 'stage')) == '更新成功':
+                            break
+                    self.assertEqual(str(progress.get_cell('0', 'stage')), '更新成功')
+                    self.assertEqual(str(progress.get_cell('1', 'stage')), '正在下载')
                     app.action_theme_toggle()
-                    self.assertEqual(bar.progress, 1)
+                    self.assertEqual(str(progress.get_cell('0', 'stage')), '更新成功')
                     gates[1].set()
                     for _ in range(30):
                         await pilot.pause(0.05)
@@ -180,11 +264,12 @@ class Interface(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
                     self.assertIsInstance(app.screen, M['UpdateResult'])
                     await pilot.press('escape')
-                    self.assertEqual(bar.progress, 2)
-                    self.assertEqual(bar.percentage, 1)
-                    self.assertFalse(app.query_one('#update-spinner').display)
+                    self.assertEqual(str(progress.get_cell('1', 'stage')), '更新失败')
+                    self.assertIn('模拟失败', str(progress.get_cell('1', 'detail')))
+                    self.assertTrue(app.query_one('#table-box').display)
                     self.assertIn('成功 1 · 失败 1', str(app.query_one('#update-summary').content))
                 finally:
+                    finish_install.set()
                     for gate in gates:
                         gate.set()
 
