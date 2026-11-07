@@ -104,6 +104,17 @@ class Detectors(unittest.TestCase):
             with patch.object(G['shutil'], 'which', return_value=executable),                  patch.object(G['os'].path, 'islink', return_value=linked):
                 self.assertEqual(M['uv_update_command']()[0], ['uv', 'self', 'update'])
 
+    def test_uninstalled_standalone_tools_are_hidden(self):
+        installed = {'uv': '/usr/bin/uv'}
+        events = []
+        with patch.object(G['shutil'], 'which', side_effect=installed.get), \
+                patch.dict(G, SELF_SPECS=[s for s in G['SELF_SPECS'] if s[0] in ('uv', 'opencode')],
+                           _cmd_version=lambda cmd: '1.0',
+                           http_text=lambda url: '{"info": {"version": "1.0"}}'):
+            M['check_self'](events.append)
+        self.assertEqual([p.key for k, p in events if k == 'tool'], ['uv'])
+        self.assertEqual(sum(k == 'group_done' for k, _ in events), 1)
+
     def test_version_baseline(self):
         self.assertTrue(M['is_newer']('1.29.2', 'rustup 1.29.1'))
         self.assertFalse(M['is_newer']('1.0', '1.0.0'))

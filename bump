@@ -278,28 +278,31 @@ env UV_INSTALL_DIR="$1" UV_NO_MODIFY_PATH=1 sh "$installer"
 
 SELF_SPECS = [
     ("bun", "Bun", lambda: _cmd_version(["bun", "-v"]), lambda: npm_latest("bun"),
-     ["bun", "upgrade"]),
+     ["bun", "upgrade"], "bun"),
     ("rustup", "rustup", lambda: _cmd_version(["rustup", "--version"]),
      lambda: toml_version(http_text("https://static.rust-lang.org/rustup/release-stable.toml")),
-     ["rustup", "self", "update"]),
+     ["rustup", "self", "update"], "rustup"),
     ("rust", "Rust (stable)", lambda: _cmd_version(["rustc", "--version"]),
      lambda: toml_version(
          http_text("https://static.rust-lang.org/dist/channel-rust-stable.toml"), "pkg.rust"),
-     ["rustup", "update"]),
+     ["rustup", "update"], "rustc"),
     ("uv", "uv", lambda: _cmd_version(["uv", "--version"]),
      lambda: json.loads(http_text("https://pypi.org/pypi/uv/json"))["info"]["version"],
-     ["uv", "self", "update"]),
+     ["uv", "self", "update"], "uv"),
     ("opencode", "opencode", lambda: _cmd_version(["opencode", "--version"]),
-     _opencode_latest, ["opencode", "upgrade"]),
+     _opencode_latest, ["opencode", "upgrade"], "opencode"),
     ("pi", "pi", _pi_local, lambda: npm_latest("@earendil-works/pi-coding-agent"),
-     ["pi", "update", "--self"]),
+     ["pi", "update", "--self"], "pi"),
     ("claude", "Claude Code", lambda: _cmd_version(["claude", "--version"]),
-     lambda: npm_latest("@anthropic-ai/claude-code"), ["claude", "update"]),
+     lambda: npm_latest("@anthropic-ai/claude-code"), ["claude", "update"], "claude"),
 ]
 
 
 def _check_one(spec):
-    key, name, local_fn, latest_fn, update_cmd = spec
+    """未安装（可执行文件不在 PATH 中）时返回 None，不进入列表。"""
+    key, name, local_fn, latest_fn, update_cmd, executable = spec
+    if not shutil.which(executable):
+        return None
     tool = Tool(key, "self", name, update_cmd)
     if key == "uv":
         tool.update_cmd, tool.description = uv_update_command()
@@ -321,7 +324,9 @@ def check_self(publish):
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(SELF_SPECS)) as pool:
         futures = [pool.submit(_check_one, spec) for spec in SELF_SPECS]
         for future in concurrent.futures.as_completed(futures):
-            publish(("tool", future.result()))
+            tool = future.result()
+            if tool is not None:
+                publish(("tool", tool))
     publish(("group_done", "self"))
 
 
