@@ -24,7 +24,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 HTTP_TIMEOUT = 20
