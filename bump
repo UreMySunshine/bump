@@ -23,7 +23,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 HTTP_TIMEOUT = 20
@@ -215,8 +215,19 @@ def check_brew(publish):
     publish(('group_done', 'brew'))
 
 
-def _alternate_chrome_devtools():
-    executable = shutil.which('chrome-devtools-mcp') or shutil.which('chrome-devtools')
+NPM_TOOLS_WITHOUT_SCRIPTS = ('agent-browser', 'agent-desktop')
+NPM_TOOLS_WITH_ALTERNATE_INSTALLS = ('chrome-devtools-mcp', *NPM_TOOLS_WITHOUT_SCRIPTS)
+
+
+def _npm_update_command(npm_cmd, package):
+    flags = ['--ignore-scripts'] if package in NPM_TOOLS_WITHOUT_SCRIPTS else []
+    return npm_cmd + ['install', '-g'] + flags + [package + '@latest']
+
+
+def _alternate_npm_tool(package):
+    executable = shutil.which(package)
+    if not executable and package == 'chrome-devtools-mcp':
+        executable = shutil.which('chrome-devtools')
     if not executable:
         return None
     bindir = Path(executable).parent
@@ -225,12 +236,11 @@ def _alternate_chrome_devtools():
     if not node.is_file() or not npm.is_file() or (default_npm and npm.resolve() == Path(default_npm).resolve()):
         return None
     npm_cmd = [str(node), str(npm)]
-    package = 'chrome-devtools-mcp'
     inventory = command_json(npm_cmd + ['list', '-g', package, '--depth=0', '--json'], allowed=(0, 1))
     info = inventory.get('dependencies', {}).get(package)
     if not info or not info.get('version'):
         return None
-    tool = Tool('npm:' + package, 'npm', package, npm_cmd + ['install', '-g', package + '@latest'])
+    tool = Tool('npm:' + package, 'npm', package, _npm_update_command(npm_cmd, package))
     tool.local = info['version']
     try:
         latest = command_json(npm_cmd + ['view', package + '@latest', 'version', '--json'])
@@ -253,23 +263,26 @@ def check_npm(publish):
         outdated = {}
         problem = str(exc)
         publish(('error', ('npm', problem)))
-    chrome_devtools = None
-    try:
-        chrome_devtools = _alternate_chrome_devtools()
-    except RuntimeError as exc:
-        publish(('error', ('npm', str(exc))))
+    alternate_tools = {}
+    for package in NPM_TOOLS_WITH_ALTERNATE_INSTALLS:
+        try:
+            tool = _alternate_npm_tool(package)
+            if tool:
+                alternate_tools[package] = tool
+        except RuntimeError as exc:
+            publish(('error', ('npm', str(exc))))
     for name, info in inventory.get('dependencies', {}).items():
-        if chrome_devtools and name == chrome_devtools.name:
+        if name in alternate_tools:
             continue
         tool = Tool('npm:%s' % name, 'npm', name,
-                    ['npm', 'install', '-g', '%s@latest' % name], authoritative=True)
+                    _npm_update_command(['npm'], name), authoritative=True)
         tool.local = info.get('version') or '?'
         tool.latest = outdated.get(name, {}).get('latest') or tool.local
         if problem or tool.local == '?':
             tool.state, tool.reason = 'unknown', problem or '无法读取已安装版本'
         publish(('tool', tool))
-    if chrome_devtools:
-        publish(('tool', chrome_devtools))
+    for tool in alternate_tools.values():
+        publish(('tool', tool))
     publish(('group_done', 'npm'))
 
 

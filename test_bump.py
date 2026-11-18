@@ -29,14 +29,15 @@ class Detectors(unittest.TestCase):
         inventory = {'formulae': [
             {'name': 'fresh', 'installed': [{'version': '1.0', 'installed_on_request': True}]},
             {'name': 'dep', 'installed': [{'version': '1.0'}, {'version': '0.9'}]},
-            {'name': 'old', 'installed': [{'version': '1.0'}]},
+            {'name': 'agent-desktop', 'installed': [{'version': '1.0'}]},
             {'name': 'pinned', 'installed': [{'version': '1.0'}], 'pinned': True}],
             'casks': [{'token': 'app', 'name': ['App'], 'installed': '1.0'}]}
-        old = {'formulae': [{'name': 'old', 'current_version': '2.0'}, {'name': 'pinned', 'current_version': '2.0'}],
+        old = {'formulae': [{'name': 'agent-desktop', 'current_version': '2.0'}, {'name': 'pinned', 'current_version': '2.0'}],
                'casks': [{'name': 'app', 'current_version': '2.0'}]}
         tools = self.collect('check_brew', iter([inventory, old]))
         self.assertEqual(len(tools), 5)
-        self.assertEqual([t.name for t in tools if t.outdated], ['old', 'app'])
+        self.assertEqual([t.name for t in tools if t.outdated], ['agent-desktop', 'app'])
+        self.assertEqual(tools[2].update_cmd, ['brew', 'upgrade', 'agent-desktop'])
         self.assertTrue(tools[1].dependency)
         self.assertEqual(tools[1].local, '1.0, 0.9')
 
@@ -71,6 +72,34 @@ class Detectors(unittest.TestCase):
             self.assertTrue(tool.outdated)
             self.assertEqual(tool.update_cmd, [str(bindir / 'node'), str(bindir / 'npm'),
                                                'install', '-g', package + '@latest'])
+
+    def test_vercel_tools_ignore_npm_lifecycle_scripts(self):
+        packages = ('agent-browser', 'agent-desktop')
+        tools = self.collect('check_npm', iter([
+            {'dependencies': {name: {'version': '1.0'} for name in packages}},
+            {name: {'latest': '2.0'} for name in packages},
+        ]))
+        self.assertEqual([tool.update_cmd for tool in tools],
+                         [['npm', 'install', '-g', '--ignore-scripts', name + '@latest'] for name in packages])
+
+    def test_agent_browser_uses_its_own_npm_with_scripts_disabled(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory:
+            bindir = Path(directory)
+            for name in ('npm', 'node', 'agent-browser'):
+                (bindir / name).touch()
+            executables = {'npm': '/usr/local/bin/npm', 'agent-browser': str(bindir / 'agent-browser')}
+            inventory = iter([{'dependencies': {}}, {},
+                              {'dependencies': {'agent-browser': {'version': '0.42.0'}}}, ['0.43.0']])
+            events = []
+            with patch.object(G['shutil'], 'which', side_effect=executables.get), \
+                    patch.dict(G, command_json=lambda *a, **kw: next(inventory)):
+                M['check_npm'](events.append)
+            tool, = [p for k, p in events if k == 'tool']
+            self.assertEqual((tool.local, tool.latest), ('0.42.0', '0.43.0'))
+            self.assertTrue(tool.outdated)
+            self.assertEqual(tool.update_cmd, [str(bindir / 'node'), str(bindir / 'npm'),
+                                               'install', '-g', '--ignore-scripts', 'agent-browser@latest'])
 
     def test_failed_update_check_preserves_inventory_as_unknown(self):
         for fn, inventory in [('check_npm', {'dependencies': {'demo': {'version': '1.0'}}}),

@@ -19,9 +19,12 @@
 | `cua-driver` | Cua Driver 当前选择的发布渠道 | `cua-driver update --apply` |
 | `browser-use` | PyPI，仅识别当前 PATH 中由 uv 管理的安装 | `uv tool upgrade browser-use`。若安装时固定了版本，则用 `uv tool install browser-use==<新版本>` 更新固定版本。 |
 | `chrome-devtools` / `chrome-devtools-mcp` | npm 全局包 `chrome-devtools-mcp` | `npm install -g chrome-devtools-mcp@latest` |
+| `agent-desktop` | Homebrew 或 npm 全局包 | `brew upgrade agent-desktop` 或 `npm install -g --ignore-scripts agent-desktop@latest` |
+| `agent-browser` | Homebrew 或 npm 全局包 | `brew upgrade agent-browser` 或 `npm install -g --ignore-scripts agent-browser@latest` |
 
 Cua Driver 更新会跳过自动注册 MCP 和创建技能链接。更新沿用已配置的 HTTPS 代理，在 macOS 上也可使用系统代理设置。
-当 Chrome DevTools 命令与默认 npm 来自不同的 Node.js 安装目录时，Bump 优先使用与该命令同目录的 Node.js 和 npm。
+当表中的 npm 工具与默认 npm 来自不同的 Node.js 安装目录时，Bump 优先使用与命令同目录且管理该包的 Node.js 和 npm。
+Bump 更新 `agent-desktop` 和 `agent-browser` 的软件包，MCP 注册和技能安装由使用者单独管理。
 
 ## 安装与运行
 
