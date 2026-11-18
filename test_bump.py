@@ -20,7 +20,8 @@ class Detectors(unittest.TestCase):
 
     def collect(self, fn, results):
         events = []
-        with patch.dict(G, command_json=lambda *a, **k: next(results)):
+        with patch.object(G['shutil'], 'which', return_value=None), \
+                patch.dict(G, command_json=lambda *a, **k: next(results)):
             M[fn](events.append)
         return [p for k, p in events if k == 'tool']
 
@@ -41,11 +42,35 @@ class Detectors(unittest.TestCase):
 
     def test_npm_complete(self):
         tools = self.collect('check_npm', iter([
-            {'dependencies': {'fresh': {'version': '1.0'}, '@scope/old': {'version': '1.0'}}},
-            {'@scope/old': {'current': '1.0', 'latest': '2.0'}}]))
-        self.assertEqual(len(tools), 2)
+            {'dependencies': {'fresh': {'version': '1.0'}, '@scope/old': {'version': '1.0'},
+                              'chrome-devtools-mcp': {'version': '1.0'}}},
+            {'@scope/old': {'current': '1.0', 'latest': '2.0'},
+             'chrome-devtools-mcp': {'current': '1.0', 'latest': '2.0'}}]))
+        self.assertEqual(len(tools), 3)
         self.assertFalse(tools[0].outdated)
         self.assertTrue(tools[1].outdated)
+        self.assertTrue(tools[2].outdated)
+        self.assertEqual(tools[2].update_cmd, ['npm', 'install', '-g', 'chrome-devtools-mcp@latest'])
+
+    def test_chrome_devtools_uses_the_node_installation_owning_its_executable(self):
+        from tempfile import TemporaryDirectory
+        package = 'chrome-devtools-mcp'
+        with TemporaryDirectory() as directory:
+            bindir = Path(directory)
+            for name in ('npm', 'node', package):
+                (bindir / name).touch()
+            executables = {'npm': '/usr/local/bin/npm', package: str(bindir / package)}
+            inventory = iter([{'dependencies': {package: {'version': '1.0'}}}, {},
+                              {'dependencies': {package: {'version': '1.2'}}}, ['1.3']])
+            events = []
+            with patch.object(G['shutil'], 'which', side_effect=executables.get), \
+                    patch.dict(G, command_json=lambda *a, **kw: next(inventory)):
+                M['check_npm'](events.append)
+            tool, = [p for k, p in events if k == 'tool']
+            self.assertEqual((tool.local, tool.latest), ('1.2', '1.3'))
+            self.assertTrue(tool.outdated)
+            self.assertEqual(tool.update_cmd, [str(bindir / 'node'), str(bindir / 'npm'),
+                                               'install', '-g', package + '@latest'])
 
     def test_failed_update_check_preserves_inventory_as_unknown(self):
         for fn, inventory in [('check_npm', {'dependencies': {'demo': {'version': '1.0'}}}),
@@ -57,7 +82,7 @@ class Detectors(unittest.TestCase):
                     raise value
                 return value
             events = []
-            with patch.dict(G, command_json=result):
+            with patch.object(G['shutil'], 'which', return_value=None), patch.dict(G, command_json=result):
                 M[fn](events.append)
             tool = next(p for k, p in events if k == 'tool')
             self.assertEqual(tool.state, 'unknown')
@@ -68,6 +93,7 @@ class Detectors(unittest.TestCase):
     def test_command_failures_and_npm_code_one(self):
         from subprocess import CompletedProcess
         for code, stdout, allowed, fails in [(2, '{}', (0, 1), True), (0, '{"error":{"summary":"失败"}}', (0,), True),
+                                            (0, '{"error":"连接超时"}', (0,), True),
                                             (1, '{}', (0, 1), False), (1, '', (0, 1), True)]:
             with patch.dict(G, run=lambda *a, **k: CompletedProcess([], code, stdout, '')):
                 if fails:
@@ -114,6 +140,50 @@ class Detectors(unittest.TestCase):
             M['check_self'](events.append)
         self.assertEqual([p.key for k, p in events if k == 'tool'], ['uv'])
         self.assertEqual(sum(k == 'group_done' for k, _ in events), 1)
+
+    def test_browser_use_uses_its_uv_installation_and_preserves_exact_pins(self):
+        from subprocess import CompletedProcess
+        spec = next(s for s in G['SELF_SPECS'] if s[0] == 'browser-use')
+        for specifier, command in [('', ['upgrade', 'browser-use']),
+                                   (' [required: ==1.0.2]', ['install', 'browser-use==1.0.6'])]:
+            with self.subTest(specifier=specifier):
+                inventory = ('browser-use v1.0.2%s (/uv/tools/browser-use)\n'
+                             '- browser-use (/uv/bin/browser-use)\n') % specifier
+                with patch.object(G['shutil'], 'which', return_value='/uv/bin/browser-use'), patch.dict(
+                    G, run=lambda *a, **k: CompletedProcess([], 0, inventory),
+                    http_text=lambda url: '{"info": {"version": "1.0.6"}}',
+                ):
+                    tool = M['_check_one'](spec)
+                self.assertEqual((tool.local, tool.latest), ('1.0.2', '1.0.6'))
+                self.assertEqual(tool.update_cmd, ['uv', 'tool'] + command)
+        with patch.object(G['shutil'], 'which', return_value='/pip/bin/browser-use'), patch.dict(
+            G, run=lambda *a, **k: CompletedProcess([], 0, inventory),
+        ):
+            self.assertIsNone(M['_check_one'](spec))
+
+    def test_cua_driver_uses_its_selected_channel(self):
+        spec = next(s for s in G['SELF_SPECS'] if s[0] == 'cua-driver')
+        release = {'current_version': '0.53.0-nightly.1', 'latest_version': '0.53.0-nightly.2',
+                   'update_available': True}
+        with patch.object(G['shutil'], 'which', return_value='/cua-driver'), patch.dict(
+            G, _cmd_version=lambda cmd: 'cua-driver 0.53.0-nightly.1',
+            command_json=lambda cmd: release,
+        ):
+            tool = M['_check_one'](spec)
+        self.assertEqual((tool.local, tool.latest), ('0.53.0-nightly.1', '0.53.0-nightly.2'))
+        self.assertTrue(tool.outdated)
+        self.assertEqual(tool.update_cmd, ['cua-driver', 'update', '--apply'])
+
+    def test_cua_driver_update_inherits_https_proxy_without_overriding_environment(self):
+        tool = M['Tool']('cua-driver', 'self', 'cua-driver')
+        tool.update_cmd = [sys.executable, '-c',
+                           'import os; print(os.environ["HTTPS_PROXY"], os.environ["CUA_DRIVER_RS_NO_MODIFY_PATH"])']
+        system_proxy = 'http://127.0.0.1:8888'
+        for configured in (None, 'http://127.0.0.1:8080'):
+            with self.subTest(configured=configured), patch.dict(
+                os.environ, {'HTTPS_PROXY': configured} if configured else {}, clear=True,
+            ), patch.object(G['urllib'].request, 'getproxies', return_value={'https': system_proxy}):
+                self.assertEqual(M['run_update'](tool), (True, '%s 1' % (configured or system_proxy)))
 
     def test_version_baseline(self):
         self.assertTrue(M['is_newer']('1.29.2', 'rustup 1.29.1'))

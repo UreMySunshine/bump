@@ -6,11 +6,22 @@
 
 - Homebrew formula、cask 和依赖包清单。
 - 当前 npm 全局目录中的直接安装包清单。
-- Bun、rustup、Rust、uv、OpenCode、Pi 和 Claude Code 的版本检查。
+- Bun、rustup、Rust、uv、OpenCode、Pi、Claude Code、Cua Driver 和通过 uv 安装的 Browser Use 的版本检查。
 - 深色、浅色、跟随终端三种主题，名称搜索、来源与状态筛选。
 - 更新前确认，逐项显示等待、执行、下载、安装及成功或失败状态，保留本次会话的结果。
 
 主要在 macOS 上验证。独立工具的不同安装渠道可能需要使用原包管理器升级；网络或版本查询失败会显示“未知”。
+
+## 浏览器与桌面自动化工具
+
+| 工具 | 版本来源 | 确认后执行的更新命令 |
+| --- | --- | --- |
+| `cua-driver` | Cua Driver 当前选择的发布渠道 | `cua-driver update --apply` |
+| `browser-use` | PyPI，仅识别当前 PATH 中由 uv 管理的安装 | `uv tool upgrade browser-use`。若安装时固定了版本，则用 `uv tool install browser-use==<新版本>` 更新固定版本。 |
+| `chrome-devtools` / `chrome-devtools-mcp` | npm 全局包 `chrome-devtools-mcp` | `npm install -g chrome-devtools-mcp@latest` |
+
+Cua Driver 更新会沿用已配置的 HTTPS 代理；在 macOS 上也可使用系统代理设置。
+当 Chrome DevTools 命令与默认 npm 来自不同的 Node.js 安装目录时，Bump 优先使用与该命令同目录的 Node.js 和 npm。
 
 ## 安装与运行
 
