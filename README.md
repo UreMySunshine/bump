@@ -20,7 +20,7 @@
 | `browser-use` | PyPI，仅识别当前 PATH 中由 uv 管理的安装 | `uv tool upgrade browser-use`。若安装时固定了版本，则用 `uv tool install browser-use==<新版本>` 更新固定版本。 |
 | `chrome-devtools` / `chrome-devtools-mcp` | npm 全局包 `chrome-devtools-mcp` | `npm install -g chrome-devtools-mcp@latest` |
 
-Cua Driver 更新会沿用已配置的 HTTPS 代理；在 macOS 上也可使用系统代理设置。
+Cua Driver 更新会跳过自动注册 MCP 和创建技能链接。更新沿用已配置的 HTTPS 代理，在 macOS 上也可使用系统代理设置。
 当 Chrome DevTools 命令与默认 npm 来自不同的 Node.js 安装目录时，Bump 优先使用与该命令同目录的 Node.js 和 npm。
 
 ## 安装与运行

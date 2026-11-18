@@ -174,16 +174,17 @@ class Detectors(unittest.TestCase):
         self.assertTrue(tool.outdated)
         self.assertEqual(tool.update_cmd, ['cua-driver', 'update', '--apply'])
 
-    def test_cua_driver_update_inherits_https_proxy_without_overriding_environment(self):
+    def test_cua_driver_update_skips_agent_setup_and_preserves_https_proxy(self):
         tool = M['Tool']('cua-driver', 'self', 'cua-driver')
         tool.update_cmd = [sys.executable, '-c',
-                           'import os; print(os.environ["HTTPS_PROXY"], os.environ["CUA_DRIVER_RS_NO_MODIFY_PATH"])']
+                           'from os import environ; print(environ["HTTPS_PROXY"], '
+                           'environ["CUA_DRIVER_RS_NO_MODIFY_PATH"], environ["CUA_DRIVER_NO_CONNECT"])']
         system_proxy = 'http://127.0.0.1:8888'
         for configured in (None, 'http://127.0.0.1:8080'):
             with self.subTest(configured=configured), patch.dict(
                 os.environ, {'HTTPS_PROXY': configured} if configured else {}, clear=True,
             ), patch.object(G['urllib'].request, 'getproxies', return_value={'https': system_proxy}):
-                self.assertEqual(M['run_update'](tool), (True, '%s 1' % (configured or system_proxy)))
+                self.assertEqual(M['run_update'](tool), (True, '%s 1 1' % (configured or system_proxy)))
 
     def test_version_baseline(self):
         self.assertTrue(M['is_newer']('1.29.2', 'rustup 1.29.1'))

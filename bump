@@ -23,7 +23,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 HTTP_TIMEOUT = 20
@@ -454,7 +454,7 @@ def run_update(tool, on_output=None):
     try:
         env = None
         if tool.key == "cua-driver":
-            env = dict(os.environ, CUA_DRIVER_RS_NO_MODIFY_PATH="1")
+            env = dict(os.environ, CUA_DRIVER_RS_NO_MODIFY_PATH="1", CUA_DRIVER_NO_CONNECT="1")
             proxy = urllib.request.getproxies().get("https")
             if proxy and not (env.get("https_proxy") or env.get("HTTPS_PROXY")):
                 env["HTTPS_PROXY"] = proxy
